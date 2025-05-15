@@ -1,120 +1,147 @@
 import streamlit as st
-import sounddevice as sd
-import numpy as np
-import wavio
 import os
+import time
+from pydub import AudioSegment
 import tempfile
-import httpx
-import io
+import pyperclip
+import requests
+import json
 
-# Initialize Groq API key
-GROQ_API_KEY = st.secrets["groq_api_key"]
+# Add API key to environment if provided
+if 'GROQ_API_KEY' not in os.environ:
+    os.environ['GROQ_API_KEY'] = st.secrets["groq_api_key"]
 
-# Set up Streamlit page configuration
-st.set_page_config(page_title="Audio Recorder and Transcriber", page_icon="🎤")
-st.title("Audio Recorder and Transcriber")
+def get_audio_info(input_file):
+    audio = AudioSegment.from_file(input_file)
+    duration = len(audio) / 1000  # Duration in seconds
+    return duration
 
-# Audio recording parameters
-SAMPLE_RATE = 44100
-CHANNELS = 1
+def calculate_bitrate(duration, target_size):
+    bitrate = (target_size * 8) / (1.048576 * duration)
+    return int(bitrate)
 
-def record_audio(duration, samplerate=SAMPLE_RATE, channels=CHANNELS):
-    """Record audio for a specified duration."""
-    recording = sd.rec(int(duration * samplerate),
-                      samplerate=samplerate,
-                      channels=channels,
-                      dtype='float32')
-    st.info("Recording...")
-    sd.wait()
-    return recording
+def compress_audio(input_file, bitrate):
+    audio = AudioSegment.from_file(input_file)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    audio.export(temp_file.name, format='mp3', bitrate=f'{bitrate}k')
+    return temp_file.name
 
-def process_audio(audio_content: bytes, model: str = "whisper-large-v3"):
-    """Process audio content using Groq's Whisper API."""
-    url = "https://api.groq.com/openai/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+def is_valid_audio_format(filename):
+    valid_formats = ['.mp3', '.mp4', '.mpeg', '.mpga', '.m4a', '.wav', '.webm']
+    _, extension = os.path.splitext(filename)
+    return extension.lower() in valid_formats
 
-    # Prepare audio file
-    audio_file = io.BytesIO(audio_content)
-    audio_file.name = "audio.wav"
-
-    files = {"file": audio_file}
-    data = {
-        "model": model,
-        "response_format": "verbose_json"
-    }
-
-    # Create two transcription requests, one for English and one for Hindi
-    languages = ["en", "hi"]
-    transcriptions = {}
-
-    for lang in languages:
-        data["language"] = lang
-        with httpx.Client() as client:
-            response = client.post(
-                url, headers=headers, files=files, data=data, timeout=None
-            )
-            response.raise_for_status()
-            transcriptions[lang] = response.json()["text"]
-
-    return transcriptions
-
-# Session state for recording status
-if 'recording' not in st.session_state:
-    st.session_state.recording = False
-if 'audio_data' not in st.session_state:
-    st.session_state.audio_data = None
-
-# Create the main interface
-col1, col2 = st.columns(2)
-
-with col1:
-    duration = st.number_input("Recording duration (seconds)", min_value=1, max_value=30, value=5)
-
-with col2:
-    if st.button("Start Recording"):
-        st.session_state.audio_data = record_audio(duration)
-        st.session_state.recording = True
-
-# Process and display the recording
-if st.session_state.recording and st.session_state.audio_data is not None:
-    # Create a temporary directory to store the audio file
-    temp_dir = tempfile.mkdtemp()
-    temp_audio_path = os.path.join(temp_dir, "recorded_audio.wav")
-    
-    # Save as WAV file
-    wavio.write(temp_audio_path, st.session_state.audio_data, SAMPLE_RATE, sampwidth=3)
-    
-    # Add a playback option
-    st.audio(temp_audio_path)
-    
-    # Transcribe with Groq
-    with st.spinner("Transcribing audio in English and Hindi..."):
-        try:
-            with open(temp_audio_path, "rb") as file:
-                audio_content = file.read()
-                transcriptions = process_audio(audio_content)
-                
-            # Display transcriptions
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.write("### English Transcription:")
-                st.write(transcriptions["en"])
-                
-            with col2:
-                st.write("### Hindi Transcription:")
-                st.write(transcriptions["hi"])
-                
-        except Exception as e:
-            st.error(f"Error during transcription: {str(e)}")
-    
-    # Cleanup temporary files
+def transcribe_audio_groq(input_file):
     try:
-        os.remove(temp_audio_path)
-        os.rmdir(temp_dir)
-    except:
-        pass
-    
-    # Reset recording state
-    st.session_state.recording = False
-    st.session_state.audio_data = None
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('GROQ_API_KEY')}"
+        }
+        
+        start_time = time.time()
+        
+        with open(input_file, 'rb') as f:
+            files = {
+                'file': (os.path.basename(input_file), f, 'audio/mpeg'),
+                'model': (None, 'whisper-large-v3-turbo'),
+                'response_format': (None, 'verbose_json')
+            }
+            
+            response = requests.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=headers,
+                files=files
+            )
+            
+        end_time = time.time()
+        
+        if response.status_code != 200:
+            raise Exception(f"API request failed: {response.text}")
+            
+        result = response.json()
+        return result.get('text', ''), end_time - start_time
+    except Exception as e:
+        if 'api_key' in str(e).lower():
+            raise Exception("Groq API key not set. Please set the GROQ_API_KEY environment variable.")
+        raise e
+
+def save_transcript_to_file(transcript, filename):
+    try:
+        with open(filename, "w") as f:
+            f.write(transcript)
+        return True
+    except Exception as e:
+        st.error(f"Failed to save transcript: {str(e)}")
+        return False
+
+def main():
+    st.title("Whisper Web UI")
+
+    # Use session state to store the transcript and user confirmation
+    if 'transcript' not in st.session_state:
+        st.session_state.transcript = ""
+    if 'transcription_time' not in st.session_state:
+        st.session_state.transcription_time = 0
+
+    uploaded_file = st.file_uploader("Choose an audio file", type=["mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm"])
+
+    if uploaded_file is not None:
+        st.audio(uploaded_file, format="audio/mp3")
+
+        if st.button("Process Audio"):
+            with st.spinner("Processing audio..."):
+                # Save uploaded file temporarily
+                temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1])
+                temp_input.write(uploaded_file.getvalue())
+                temp_input.close()
+
+                file_size = os.path.getsize(temp_input.name) / (1024 * 1024)  # File size in MB
+                st.write(f"Input file size: {file_size:.2f} MB")
+
+                if file_size > 25:
+                    st.write("File size exceeds 25MB. Compressing...")
+                    target_size = 24.9 * 1024  # Target size in kilobytes (just under 25MB)
+                    duration = get_audio_info(temp_input.name)
+                    bitrate = calculate_bitrate(duration, target_size)
+                    compressed_file = compress_audio(temp_input.name, bitrate)
+                    input_file = compressed_file
+                    st.write("Compression complete.")
+                else:
+                    st.write("File size is within the allowed limit. No compression needed.")
+                    input_file = temp_input.name
+
+                st.write("Transcribing audio using Groq API...")
+                try:
+                    st.session_state.transcript, st.session_state.transcription_time = transcribe_audio_groq(input_file)
+                    st.write(f"Transcription complete! Time taken: {st.session_state.transcription_time:.2f} seconds")
+                except Exception as e:
+                    st.error(f"Transcription failed: {str(e)}")
+
+                # Cleanup temporary files
+                os.unlink(temp_input.name)
+                if file_size > 25:
+                    os.unlink(compressed_file)
+
+        # Display transcript and controls
+        if st.session_state.transcript:
+            st.subheader("Transcript:")
+            st.text_area("", value=st.session_state.transcript, height=300)
+
+            if st.button("Copy to Clipboard"):
+                try:
+                    pyperclip.copy(st.session_state.transcript)
+                    st.success("Transcript copied to clipboard!")
+                except Exception as e:
+                    st.error(f"Failed to copy to clipboard: {str(e)}")
+
+            st.subheader("Save Transcript to File")
+            output_filename = st.text_input("Enter output filename for transcript:")
+            if st.button("Save Transcript"):
+                if output_filename:
+                    if save_transcript_to_file(st.session_state.transcript, output_filename):
+                        st.success(f"Transcript saved to {output_filename}")
+                else:
+                    st.warning("Please enter a filename to save the transcript.")
+
+if __name__ == '__main__':
+    main()
+
